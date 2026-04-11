@@ -1,14 +1,24 @@
-db: db.c
-	gcc db.c -o db
+CC = gcc
+CFLAGS = -Wall -Wextra
 
-run: db
-	./db mydb.db
+SRC = src/db.c
+TARGET = db
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET) mydb.db
 
 clean:
-	rm -f db *.db
+	rm -f $(TARGET) $(TARGET).exe *.db
 
-test: db
-	bundle exec rspec
+test: $(TARGET)
+	python -m pytest tests/test_db.py -v
 
-format: *.c
-	clang-format -style=Google -i *.c
+format:
+	clang-format -style=Google -i src/*.c
+
+.PHONY: all run clean test format
