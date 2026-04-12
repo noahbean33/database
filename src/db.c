@@ -1,3 +1,21 @@
+/**
+ * @file db.c
+ * @brief A SQLite-like database engine implementing a B-tree backed, persistent
+ *        single-table database with a REPL interface.
+ *
+ * Supports INSERT and SELECT on a table with columns:
+ *   - id       (uint32)
+ *   - username (varchar 32)
+ *   - email    (varchar 255)
+ *
+ * Data is stored in fixed-size 4096-byte pages with a B-tree index.
+ * The B-tree uses separate leaf and internal node formats, and performs
+ * automatic node splitting when capacity is exceeded.
+ *
+ * Usage: ./db <filename>
+ * Meta-commands: .exit, .btree, .constants
+ */
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -7,22 +25,26 @@
 #include <string.h>
 #include <unistd.h>
 
+/** Buffer for storing a single line of user input from the REPL. */
 typedef struct {
-  char* buffer;
-  size_t buffer_length;
-  ssize_t input_length;
+  char* buffer;          /**< Dynamically allocated input string. */
+  size_t buffer_length;  /**< Allocated capacity of buffer. */
+  ssize_t input_length;  /**< Length of the last read input (excluding newline). */
 } InputBuffer;
 
+/** Result codes returned after executing a SQL statement. */
 typedef enum {
   EXECUTE_SUCCESS,
   EXECUTE_DUPLICATE_KEY,
 } ExecuteResult;
 
+/** Result codes returned after processing a meta-command (e.g. .exit). */
 typedef enum {
   META_COMMAND_SUCCESS,
   META_COMMAND_UNRECOGNIZED_COMMAND
 } MetaCommandResult;
 
+/** Result codes returned when parsing user input into a statement. */
 typedef enum {
   PREPARE_SUCCESS,
   PREPARE_NEGATIVE_ID,
@@ -31,23 +53,32 @@ typedef enum {
   PREPARE_UNRECOGNIZED_STATEMENT
 } PrepareResult;
 
+/** Supported SQL statement types. */
 typedef enum { STATEMENT_INSERT, STATEMENT_SELECT } StatementType;
 
-#define COLUMN_USERNAME_SIZE 32
-#define COLUMN_EMAIL_SIZE 255
+#define COLUMN_USERNAME_SIZE 32  /**< Maximum username length in characters. */
+#define COLUMN_EMAIL_SIZE 255    /**< Maximum email length in characters. */
+
+/** A single row in the database table: (id, username, email). */
 typedef struct {
   uint32_t id;
   char username[COLUMN_USERNAME_SIZE + 1];
   char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 
+/** A parsed SQL statement ready for execution. */
 typedef struct {
   StatementType type;
-  Row row_to_insert;  // only used by insert statement
+  Row row_to_insert;  /**< Payload for INSERT statements. */
 } Statement;
 
+/** Compute the byte size of a struct member at compile time. */
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
+/*
+ * Row Serialization Layout
+ * Rows are serialized as: [id | username | email] with fixed-width fields.
+ */
 const uint32_t ID_SIZE = size_of_attribute(Row, id);
 const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
 const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);
@@ -56,34 +87,42 @@ const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
-const uint32_t PAGE_SIZE = 4096;
-#define TABLE_MAX_PAGES 400
+/*
+ * Pager Constants
+ */
+const uint32_t PAGE_SIZE = 4096;     /**< Size of each database page in bytes. */
+#define TABLE_MAX_PAGES 400          /**< Maximum number of pages in the database. */
 
-#define INVALID_PAGE_NUM UINT32_MAX
+#define INVALID_PAGE_NUM UINT32_MAX  /**< Sentinel value for an uninitialized page pointer. */
 
+/** Manages page-level I/O between memory and the database file on disk. */
 typedef struct {
-  int file_descriptor;
-  uint32_t file_length;
-  uint32_t num_pages;
-  void* pages[TABLE_MAX_PAGES];
+  int file_descriptor;           /**< Open file descriptor for the database file. */
+  off_t file_length;             /**< Total byte length of the database file. */
+  uint32_t num_pages;            /**< Number of pages currently in use. */
+  void* pages[TABLE_MAX_PAGES];  /**< In-memory page cache (NULL = not loaded). */
 } Pager;
 
+/** Represents an open database table backed by a B-tree. */
 typedef struct {
-  Pager* pager;
-  uint32_t root_page_num;
+  Pager* pager;             /**< Pager handling disk I/O for this table. */
+  uint32_t root_page_num;   /**< Page number of the B-tree root node. */
 } Table;
 
+/** Points to a specific location in the table; used for traversal and insertion. */
 typedef struct {
-  Table* table;
-  uint32_t page_num;
-  uint32_t cell_num;
-  bool end_of_table;  // Indicates a position one past the last element
+  Table* table;        /**< The table this cursor belongs to. */
+  uint32_t page_num;   /**< Page number of the leaf node the cursor points to. */
+  uint32_t cell_num;   /**< Cell index within the leaf node. */
+  bool end_of_table;   /**< True when the cursor is past the last row. */
 } Cursor;
 
+/** Print a row to stdout in the format (id, username, email). */
 void print_row(Row* row) {
-  printf("(%d, %s, %s)\n", row->id, row->username, row->email);
+  printf("(%u, %s, %s)\n", row->id, row->username, row->email);
 }
 
+/** B-tree node types: internal nodes hold keys and child pointers; leaf nodes hold keys and row data. */
 typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 
 /*
@@ -148,44 +187,57 @@ const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
 const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT =
     (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
 
+/** Read the NodeType (leaf or internal) from a B-tree node's header. */
 NodeType get_node_type(void* node) {
-  uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
+  uint8_t value = *((uint8_t*)((char*)node + NODE_TYPE_OFFSET));
   return (NodeType)value;
 }
 
+/** Write the NodeType to a B-tree node's header. */
 void set_node_type(void* node, NodeType type) {
   uint8_t value = type;
-  *((uint8_t*)(node + NODE_TYPE_OFFSET)) = value;
+  *((uint8_t*)((char*)node + NODE_TYPE_OFFSET)) = value;
 }
 
+/** Return true if the given node is the root of the B-tree. */
 bool is_node_root(void* node) {
-  uint8_t value = *((uint8_t*)(node + IS_ROOT_OFFSET));
+  uint8_t value = *((uint8_t*)((char*)node + IS_ROOT_OFFSET));
   return (bool)value;
 }
 
+/** Set or clear the is-root flag in a node's header. */
 void set_node_root(void* node, bool is_root) {
   uint8_t value = is_root;
-  *((uint8_t*)(node + IS_ROOT_OFFSET)) = value;
+  *((uint8_t*)((char*)node + IS_ROOT_OFFSET)) = value;
 }
 
-uint32_t* node_parent(void* node) { return node + PARENT_POINTER_OFFSET; }
+/** Return a pointer to the parent page number stored in a node's header. */
+uint32_t* node_parent(void* node) { return (uint32_t*)((char*)node + PARENT_POINTER_OFFSET); }
 
+/** Return a pointer to the key count in an internal node. */
 uint32_t* internal_node_num_keys(void* node) {
-  return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
+  return (uint32_t*)((char*)node + INTERNAL_NODE_NUM_KEYS_OFFSET);
 }
 
+/** Return a pointer to the rightmost child page number in an internal node. */
 uint32_t* internal_node_right_child(void* node) {
-  return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
+  return (uint32_t*)((char*)node + INTERNAL_NODE_RIGHT_CHILD_OFFSET);
 }
 
+/** Return a pointer to the cell (child_ptr + key) at cell_num in an internal node. */
 uint32_t* internal_node_cell(void* node, uint32_t cell_num) {
-  return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
+  return (uint32_t*)((char*)node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE);
 }
 
+/**
+ * Return a pointer to the child page number at child_num in an internal node.
+ * If child_num == num_keys, returns the rightmost child pointer.
+ * Aborts if child_num is out of range or points to an invalid page.
+ */
 uint32_t* internal_node_child(void* node, uint32_t child_num) {
   uint32_t num_keys = *internal_node_num_keys(node);
   if (child_num > num_keys) {
-    printf("Tried to access child_num %d > num_keys %d\n", child_num, num_keys);
+    printf("Tried to access child_num %u > num_keys %u\n", child_num, num_keys);
     exit(EXIT_FAILURE);
   } else if (child_num == num_keys) {
     uint32_t* right_child = internal_node_right_child(node);
@@ -197,40 +249,51 @@ uint32_t* internal_node_child(void* node, uint32_t child_num) {
   } else {
     uint32_t* child = internal_node_cell(node, child_num);
     if (*child == INVALID_PAGE_NUM) {
-      printf("Tried to access child %d of node, but was invalid page\n", child_num);
+      printf("Tried to access child %u of node, but was invalid page\n", child_num);
       exit(EXIT_FAILURE);
     }
     return child;
   }
 }
 
+/** Return a pointer to the key at key_num in an internal node. */
 uint32_t* internal_node_key(void* node, uint32_t key_num) {
-  return (void*)internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+  return (uint32_t*)((char*)internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE);
 }
 
+/** Return a pointer to the cell count in a leaf node. */
 uint32_t* leaf_node_num_cells(void* node) {
-  return node + LEAF_NODE_NUM_CELLS_OFFSET;
+  return (uint32_t*)((char*)node + LEAF_NODE_NUM_CELLS_OFFSET);
 }
 
+/** Return a pointer to the next-leaf page number (sibling pointer, 0 = none). */
 uint32_t* leaf_node_next_leaf(void* node) {
-  return node + LEAF_NODE_NEXT_LEAF_OFFSET;
+  return (uint32_t*)((char*)node + LEAF_NODE_NEXT_LEAF_OFFSET);
 }
 
+/** Return a pointer to the cell (key + row value) at cell_num in a leaf node. */
 void* leaf_node_cell(void* node, uint32_t cell_num) {
-  return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+  return (char*)node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
 }
 
+/** Return a pointer to the key at cell_num in a leaf node. */
 uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
   return leaf_node_cell(node, cell_num);
 }
 
+/** Return a pointer to the row value at cell_num in a leaf node. */
 void* leaf_node_value(void* node, uint32_t cell_num) {
-  return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+  return (char*)leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
 }
 
+/**
+ * Fetch a page from the pager's in-memory cache.
+ * On a cache miss, allocates a new page and reads it from the database file.
+ * Aborts if page_num is out of bounds.
+ */
 void* get_page(Pager* pager, uint32_t page_num) {
-  if (page_num > TABLE_MAX_PAGES) {
-    printf("Tried to fetch page number out of bounds. %d > %d\n", page_num,
+  if (page_num >= TABLE_MAX_PAGES) {
+    printf("Tried to fetch page number out of bounds. %u >= %d\n", page_num,
            TABLE_MAX_PAGES);
     exit(EXIT_FAILURE);
   }
@@ -264,29 +327,42 @@ void* get_page(Pager* pager, uint32_t page_num) {
   return pager->pages[page_num];
 }
 
+/**
+ * Return the maximum key in the subtree rooted at node.
+ * For leaf nodes, this is the last key. For internal nodes, recurses
+ * into the rightmost child. Aborts if called on an empty leaf.
+ */
 uint32_t get_node_max_key(Pager* pager, void* node) {
   if (get_node_type(node) == NODE_LEAF) {
-    return *leaf_node_key(node, *leaf_node_num_cells(node) - 1);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+    if (num_cells == 0) {
+      printf("Tried to get max key of empty leaf node\n");
+      exit(EXIT_FAILURE);
+    }
+    return *leaf_node_key(node, num_cells - 1);
   }
   void* right_child = get_page(pager,*internal_node_right_child(node));
   return get_node_max_key(pager, right_child);
 }
 
+/** Print database storage layout constants to stdout (for .constants command). */
 void print_constants() {
-  printf("ROW_SIZE: %d\n", ROW_SIZE);
-  printf("COMMON_NODE_HEADER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
-  printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
-  printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
-  printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
-  printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
+  printf("ROW_SIZE: %u\n", ROW_SIZE);
+  printf("COMMON_NODE_HEADER_SIZE: %u\n", COMMON_NODE_HEADER_SIZE);
+  printf("LEAF_NODE_HEADER_SIZE: %u\n", LEAF_NODE_HEADER_SIZE);
+  printf("LEAF_NODE_CELL_SIZE: %u\n", LEAF_NODE_CELL_SIZE);
+  printf("LEAF_NODE_SPACE_FOR_CELLS: %u\n", LEAF_NODE_SPACE_FOR_CELLS);
+  printf("LEAF_NODE_MAX_CELLS: %u\n", LEAF_NODE_MAX_CELLS);
 }
 
+/** Print 2*level spaces of indentation for tree visualization. */
 void indent(uint32_t level) {
   for (uint32_t i = 0; i < level; i++) {
     printf("  ");
   }
 }
 
+/** Recursively print the B-tree structure starting at page_num (for .btree command). */
 void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
   void* node = get_page(pager, page_num);
   uint32_t num_keys, child;
@@ -295,23 +371,23 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
     case (NODE_LEAF):
       num_keys = *leaf_node_num_cells(node);
       indent(indentation_level);
-      printf("- leaf (size %d)\n", num_keys);
+      printf("- leaf (size %u)\n", num_keys);
       for (uint32_t i = 0; i < num_keys; i++) {
         indent(indentation_level + 1);
-        printf("- %d\n", *leaf_node_key(node, i));
+        printf("- %u\n", *leaf_node_key(node, i));
       }
       break;
     case (NODE_INTERNAL):
       num_keys = *internal_node_num_keys(node);
       indent(indentation_level);
-      printf("- internal (size %d)\n", num_keys);
+      printf("- internal (size %u)\n", num_keys);
       if (num_keys > 0) {
         for (uint32_t i = 0; i < num_keys; i++) {
           child = *internal_node_child(node, i);
           print_tree(pager, child, indentation_level + 1);
 
           indent(indentation_level + 1);
-          printf("- key %d\n", *internal_node_key(node, i));
+          printf("- key %u\n", *internal_node_key(node, i));
         }
         child = *internal_node_right_child(node);
         print_tree(pager, child, indentation_level + 1);
@@ -320,18 +396,21 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
   }
 }
 
+/** Serialize a Row struct into a compact, fixed-width byte layout at destination. */
 void serialize_row(Row* source, void* destination) {
-  memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
-  memcpy(destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-  memcpy(destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+  memcpy((char*)destination + ID_OFFSET, &(source->id), ID_SIZE);
+  memcpy((char*)destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
+  memcpy((char*)destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
 }
 
+/** Deserialize a compact byte layout at source into a Row struct. */
 void deserialize_row(void* source, Row* destination) {
-  memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
-  memcpy(&(destination->username), source + USERNAME_OFFSET, USERNAME_SIZE);
-  memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
+  memcpy(&(destination->id), (char*)source + ID_OFFSET, ID_SIZE);
+  memcpy(&(destination->username), (char*)source + USERNAME_OFFSET, USERNAME_SIZE);
+  memcpy(&(destination->email), (char*)source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
+/** Initialize a page as an empty leaf node with zero cells and no sibling. */
 void initialize_leaf_node(void* node) {
   set_node_type(node, NODE_LEAF);
   set_node_root(node, false);
@@ -339,6 +418,7 @@ void initialize_leaf_node(void* node) {
   *leaf_node_next_leaf(node) = 0;  // 0 represents no sibling
 }
 
+/** Initialize a page as an empty internal node with zero keys. */
 void initialize_internal_node(void* node) {
   set_node_type(node, NODE_INTERNAL);
   set_node_root(node, false);
@@ -351,6 +431,10 @@ void initialize_internal_node(void* node) {
   *internal_node_right_child(node) = INVALID_PAGE_NUM;
 }
 
+/**
+ * Binary search for key in the leaf node at page_num.
+ * Returns a cursor pointing to the key if found, or to the insertion point.
+ */
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
   void* node = get_page(table->pager, page_num);
   uint32_t num_cells = *leaf_node_num_cells(node);
@@ -406,6 +490,7 @@ uint32_t internal_node_find_child(void* node, uint32_t key) {
   return min_index;
 }
 
+/** Recursively search the subtree at page_num for key, returning a cursor to its leaf position. */
 Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
   void* node = get_page(table->pager, page_num);
 
@@ -418,6 +503,8 @@ Cursor* internal_node_find(Table* table, uint32_t page_num, uint32_t key) {
     case NODE_INTERNAL:
       return internal_node_find(table, child_num, key);
   }
+  printf("Error: corrupted node type in internal_node_find\n");
+  exit(EXIT_FAILURE);
 }
 
 /*
@@ -436,6 +523,7 @@ Cursor* table_find(Table* table, uint32_t key) {
   }
 }
 
+/** Return a cursor pointing to the first row (smallest key) in the table. */
 Cursor* table_start(Table* table) {
   Cursor* cursor = table_find(table, 0);
 
@@ -446,12 +534,14 @@ Cursor* table_start(Table* table) {
   return cursor;
 }
 
+/** Return a pointer to the serialized row data at the cursor's current position. */
 void* cursor_value(Cursor* cursor) {
   uint32_t page_num = cursor->page_num;
   void* page = get_page(cursor->table->pager, page_num);
   return leaf_node_value(page, cursor->cell_num);
 }
 
+/** Advance the cursor to the next row, crossing leaf boundaries via sibling pointers. */
 void cursor_advance(Cursor* cursor) {
   uint32_t page_num = cursor->page_num;
   void* node = get_page(cursor->table->pager, page_num);
@@ -470,6 +560,10 @@ void cursor_advance(Cursor* cursor) {
   }
 }
 
+/**
+ * Open a database file and initialize the pager.
+ * Creates the file if it does not exist. Aborts on I/O errors or corruption.
+ */
 Pager* pager_open(const char* filename) {
   int fd = open(filename,
                 O_RDWR |      // Read/Write mode
@@ -502,6 +596,10 @@ Pager* pager_open(const char* filename) {
   return pager;
 }
 
+/**
+ * Open a database, initializing an empty B-tree if the file is new.
+ * Returns a Table handle used by all subsequent operations.
+ */
 Table* db_open(const char* filename) {
   Pager* pager = pager_open(filename);
 
@@ -519,6 +617,7 @@ Table* db_open(const char* filename) {
   return table;
 }
 
+/** Allocate and zero-initialize a new InputBuffer. */
 InputBuffer* new_input_buffer() {
   InputBuffer* input_buffer = malloc(sizeof(InputBuffer));
   input_buffer->buffer = NULL;
@@ -528,8 +627,10 @@ InputBuffer* new_input_buffer() {
   return input_buffer;
 }
 
+/** Print the REPL prompt to stdout. */
 void print_prompt() { printf("db > "); }
 
+/** Read a line of input from stdin into the buffer. Aborts on read failure. */
 void read_input(InputBuffer* input_buffer) {
   ssize_t bytes_read =
       getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
@@ -544,11 +645,13 @@ void read_input(InputBuffer* input_buffer) {
   input_buffer->buffer[bytes_read - 1] = 0;
 }
 
+/** Free an InputBuffer and its dynamically allocated contents. */
 void close_input_buffer(InputBuffer* input_buffer) {
   free(input_buffer->buffer);
   free(input_buffer);
 }
 
+/** Write the in-memory page at page_num to its corresponding position on disk. */
 void pager_flush(Pager* pager, uint32_t page_num) {
   if (pager->pages[page_num] == NULL) {
     printf("Tried to flush null page\n");
@@ -571,6 +674,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
   }
 }
 
+/** Flush all dirty pages to disk, close the file, and free all resources. */
 void db_close(Table* table) {
   Pager* pager = table->pager;
 
@@ -599,6 +703,10 @@ void db_close(Table* table) {
   free(table);
 }
 
+/**
+ * Process a meta-command (input starting with '.').
+ * Handles .exit, .btree, and .constants.
+ */
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     close_input_buffer(input_buffer);
@@ -617,10 +725,15 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   }
 }
 
+/**
+ * Parse an INSERT statement from the input buffer.
+ * Expected format: "insert <id> <username> <email>"
+ * Validates id is positive and strings are within size limits.
+ */
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   statement->type = STATEMENT_INSERT;
 
-  char* keyword = strtok(input_buffer->buffer, " ");
+  strtok(input_buffer->buffer, " ");
   char* id_string = strtok(NULL, " ");
   char* username = strtok(NULL, " ");
   char* email = strtok(NULL, " ");
@@ -647,6 +760,7 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   return PREPARE_SUCCESS;
 }
 
+/** Parse user input into a Statement, dispatching by SQL keyword. */
 PrepareResult prepare_statement(InputBuffer* input_buffer,
                                 Statement* statement) {
   if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
@@ -666,6 +780,11 @@ go onto the end of the database file
 */
 uint32_t get_unused_page_num(Pager* pager) { return pager->num_pages; }
 
+/**
+ * Create a new root node after a split.
+ * The old root is copied to a new page (becomes left child), and the root
+ * page is re-initialized as an internal node pointing to left and right children.
+ */
 void create_new_root(Table* table, uint32_t right_child_page_num) {
   /*
   Handle splitting the root.
@@ -711,9 +830,14 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
   *node_parent(right_child) = table->root_page_num;
 }
 
+/** Forward declaration: split a full internal node and insert a new child. */
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
                           uint32_t child_page_num);
 
+/**
+ * Insert a new child/key pair into the internal node at parent_page_num.
+ * If the node is full, delegates to internal_node_split_and_insert.
+ */
 void internal_node_insert(Table* table, uint32_t parent_page_num,
                           uint32_t child_page_num) {
   /*
@@ -768,11 +892,18 @@ void internal_node_insert(Table* table, uint32_t parent_page_num,
   }
 }
 
+/** Update a key in an internal node when a child's maximum key changes after a split. */
 void update_internal_node_key(void* node, uint32_t old_key, uint32_t new_key) {
   uint32_t old_child_index = internal_node_find_child(node, old_key);
   *internal_node_key(node, old_child_index) = new_key;
 }
 
+/**
+ * Split a full internal node and insert a new child.
+ * Moves the upper half of keys/children to a new node, promotes the middle
+ * key to the parent, and inserts the new child into the appropriate half.
+ * If the node being split is the root, creates a new root.
+ */
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
                           uint32_t child_page_num) {
   uint32_t old_page_num = parent_page_num;
@@ -800,7 +931,7 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
   uint32_t splitting_root = is_node_root(old_node);
 
   void* parent;
-  void* new_node;
+  void* new_node = NULL;
   if (splitting_root) {
     create_new_root(table, new_page_num);
     parent = get_page(table->pager,table->root_page_num);
@@ -867,6 +998,11 @@ void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
   }
 }
 
+/**
+ * Split a full leaf node and insert a new key/value pair.
+ * Divides cells evenly between the old (left) and new (right) nodes,
+ * updates sibling pointers, and propagates the split to the parent.
+ */
 void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
   /*
   Create a new node and move half the cells over.
@@ -926,6 +1062,10 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
   }
 }
 
+/**
+ * Insert a key/value pair into a leaf node at the cursor position.
+ * If the leaf is full, delegates to leaf_node_split_and_insert.
+ */
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
   void* node = get_page(cursor->table->pager, cursor->page_num);
 
@@ -949,6 +1089,7 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
   serialize_row(value, leaf_node_value(node, cursor->cell_num));
 }
 
+/** Execute an INSERT statement: find the correct leaf and insert the row. */
 ExecuteResult execute_insert(Statement* statement, Table* table) {
   Row* row_to_insert = &(statement->row_to_insert);
   uint32_t key_to_insert = row_to_insert->id;
@@ -960,6 +1101,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
   if (cursor->cell_num < num_cells) {
     uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
     if (key_at_index == key_to_insert) {
+      free(cursor);
       return EXECUTE_DUPLICATE_KEY;
     }
   }
@@ -971,6 +1113,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
   return EXECUTE_SUCCESS;
 }
 
+/** Execute a SELECT statement: scan all rows and print them to stdout. */
 ExecuteResult execute_select(Statement* statement, Table* table) {
   Cursor* cursor = table_start(table);
 
@@ -986,6 +1129,7 @@ ExecuteResult execute_select(Statement* statement, Table* table) {
   return EXECUTE_SUCCESS;
 }
 
+/** Dispatch a prepared statement to the appropriate executor. */
 ExecuteResult execute_statement(Statement* statement, Table* table) {
   switch (statement->type) {
     case (STATEMENT_INSERT):
@@ -993,8 +1137,14 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
     case (STATEMENT_SELECT):
       return execute_select(statement, table);
   }
+  printf("Error: unhandled statement type\n");
+  exit(EXIT_FAILURE);
 }
 
+/**
+ * Entry point: opens the database file and runs the interactive REPL.
+ * Usage: ./db <filename>
+ */
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     printf("Must supply a database filename.\n");
